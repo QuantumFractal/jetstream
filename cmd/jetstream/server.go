@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"github.com/bluesky-social/jetstream/pkg/models"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
+	"github.com/labstack/gommon/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/time/rate"
@@ -28,6 +28,14 @@ var (
 type WantedCollections struct {
 	Prefixes  []string
 	FullPaths map[string]struct{}
+}
+
+type ConfigRequest struct {
+	WantedCollections        []string `query:"wantedCollections" json:"wantedCollections"`
+	WantedDids               []string `query:"wantedDids" json:"wantedDids"`
+	Cursor                   *int64   `query:"cursor" json:"cursor"`
+	WantedCollectionPrefixes []string
+	Compress                 bool
 }
 
 type Subscriber struct {
@@ -272,69 +280,14 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 	ctx, cancel := context.WithCancel(c.Request().Context())
 	defer cancel()
 
-	wantedCollections := []string{}
-	wantedCollectionPrefixes := []string{}
-	qWantedCollections := c.Request().URL.Query()["wantedCollections"]
-	if len(qWantedCollections) > 0 {
-		for _, wantedCol := range qWantedCollections {
-			if strings.HasSuffix(wantedCol, ".*") {
-				wantedCollectionPrefixes = append(wantedCollectionPrefixes, strings.TrimSuffix(wantedCol, "*"))
-				continue
-			}
-
-			col, err := syntax.ParseNSID(wantedCol)
-			if err != nil {
-				c.String(http.StatusBadRequest, fmt.Sprintf("invalid collection: %s", wantedCol))
-				return fmt.Errorf("invalid collection: %s", wantedCol)
-			}
-			wantedCollections = append(wantedCollections, col.String())
-		}
+	cr := ConfigRequest{
+		WantedCollectionPrefixes: []string{},
+		Compress:                 false,
 	}
-
-	// Reject requests with too many wanted collections
-	if len(wantedCollections)+len(wantedCollectionPrefixes) > 100 {
-		c.String(http.StatusBadRequest, "too many wanted collections")
-		return fmt.Errorf("too many wanted collections")
-	}
-
-	wantedDids := []string{}
-	qWantedDids := c.Request().URL.Query()["wantedDids"]
-	if len(qWantedDids) > 0 {
-		for _, d := range qWantedDids {
-			did, err := syntax.ParseDID(d)
-			if err != nil {
-				c.String(http.StatusBadRequest, fmt.Sprintf("invalid did: %s", d))
-				return fmt.Errorf("invalid did: %s", d)
-			}
-			wantedDids = append(wantedDids, did.String())
-		}
-	}
-
-	// Reject requests with too many wanted DIDs
-	if len(wantedDids) > 10_000 {
-		c.String(http.StatusBadRequest, "too many wanted DIDs")
-		return fmt.Errorf("too many wanted DIDs")
-	}
-
-	// Check if the user wants zstd compression
-	socketEncoding := c.Request().Header.Get("Socket-Encoding")
-	compress := strings.Contains(socketEncoding, "zstd")
-
-	var cursor *int64
-	var err error
-	qCursor := c.Request().URL.Query().Get("cursor")
-	if qCursor != "" {
-		cursor = new(int64)
-		*cursor, err = strconv.ParseInt(qCursor, 10, 64)
-		if err != nil {
-			c.String(http.StatusBadRequest, fmt.Sprintf("invalid cursor: %s", qCursor))
-			return fmt.Errorf("invalid cursor: %s", qCursor)
-		}
-
-		// If given a future cursor, just live tail
-		if *cursor > time.Now().UnixMicro() {
-			cursor = nil
-		}
+	err := cr.ValidateConfig(c)
+	if err != nil {
+		log.Error(err)
+		return err
 	}
 
 	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
@@ -347,6 +300,7 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 
 	go func() {
 		for {
+			// TODO - tmoll - handle messages from client.
 			_, _, err := ws.ReadMessage()
 			if err != nil {
 				log.Error("failed to read message from websocket", "error", err)
@@ -356,20 +310,21 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 		}
 	}()
 
-	sub, err := s.AddSubscriber(ws, c.RealIP(), compress, wantedCollectionPrefixes, wantedCollections, wantedDids, cursor)
+	// TODO - refactor AddSubscriber to support configRequest
+	sub, err := s.AddSubscriber(ws, c.RealIP(), cr.Compress, cr.WantedCollectionPrefixes, cr.WantedCollections, cr.WantedDids, cr.Cursor)
 	if err != nil {
 		log.Error("failed to add subscriber", "error", err)
 		return err
 	}
 	defer s.RemoveSubscriber(sub.id)
 
-	if cursor != nil {
-		log.Info("replaying events", "cursor", *cursor)
+	if cr.Cursor != nil {
+		log.Info("replaying events", "cursor", *cr.Cursor)
 		playbackRateLimit := s.maxSubRate * 10
 
 		go func() {
 			for {
-				lastSeq, err := s.Consumer.ReplayEvents(ctx, sub.compress, *cursor, playbackRateLimit, func(ctx context.Context, timeUS int64, did, collection string, getEventBytes func() []byte) error {
+				lastSeq, err := s.Consumer.ReplayEvents(ctx, sub.compress, *cr.Cursor, playbackRateLimit, func(ctx context.Context, timeUS int64, did, collection string, getEventBytes func() []byte) error {
 					return emitToSubscriber(ctx, log, sub, timeUS, did, collection, true, getEventBytes)
 				})
 				if err != nil {
@@ -388,7 +343,7 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 				// Otherwise, update the cursor and replay again
 				lastSeq++
 				sub.cLk.Lock()
-				cursor = &lastSeq
+				cr.Cursor = &lastSeq
 				sub.cLk.Unlock()
 			}
 			log.Info("finished replaying events, starting live tail")
@@ -411,7 +366,7 @@ func (s *Server) HandleSubscribe(c echo.Context) error {
 			}
 
 			// When compression is enabled, the buffer contains the compressed message
-			if compress {
+			if cr.Compress {
 				if err := ws.WriteMessage(websocket.BinaryMessage, *msg); err != nil {
 					log.Error("failed to write message to websocket", "error", err)
 					return nil
@@ -448,4 +403,76 @@ func (sub *Subscriber) WantsCollection(collection string) bool {
 	}
 
 	return false
+}
+
+func (cr *ConfigRequest) ValidateConfig(c echo.Context) error {
+	err := c.Bind(cr)
+	if err != nil {
+		c.String(http.StatusBadRequest, "bad request")
+		return err
+	}
+
+	// NB: echo doesn't split strings into a collection so we must split on a comma here
+	if len(cr.WantedCollections) == 1 {
+		cr.WantedCollections = strings.Split(cr.WantedCollections[0], ",")
+	}
+	if len(cr.WantedDids) == 1 {
+		cr.WantedDids = strings.Split(cr.WantedDids[0], ",")
+	}
+
+	wantedCollections := []string{}
+	wantedCollectionPrefixes := []string{}
+	for _, wantedCol := range cr.WantedCollections {
+		if strings.HasSuffix(wantedCol, ".*") {
+			wantedCollectionPrefixes = append(wantedCollectionPrefixes, strings.TrimSuffix(wantedCol, "*"))
+			continue
+		}
+
+		col, err := syntax.ParseNSID(wantedCol)
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("invalid collection: %s", wantedCol))
+			return fmt.Errorf("invalid collection: %s", wantedCol)
+		}
+		wantedCollections = append(wantedCollections, col.String())
+	}
+	cr.WantedCollections = wantedCollections
+	cr.WantedCollectionPrefixes = wantedCollectionPrefixes
+
+	// Reject requests with too many wanted collections
+	if len(wantedCollections)+len(wantedCollectionPrefixes) > 100 {
+		c.String(http.StatusBadRequest, "too many wanted collections")
+		return fmt.Errorf("too many wanted collections")
+	}
+
+	wantedDids := []string{}
+	for _, d := range cr.WantedDids {
+		did, err := syntax.ParseDID(d)
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("invalid did: %s", d))
+			return fmt.Errorf("invalid did: %s", d)
+		}
+		wantedDids = append(wantedDids, did.String())
+	}
+	cr.WantedDids = wantedDids
+
+	// Reject requests with too many wanted DIDs
+	if len(wantedDids) > 10_000 {
+		c.String(http.StatusBadRequest, "too many wanted DIDs")
+		return fmt.Errorf("too many wanted DIDs")
+	}
+
+	// Check if the user wants zstd compression
+	socketEncoding := c.Request().Header.Get("Socket-Encoding")
+	cr.Compress = strings.Contains(socketEncoding, "zstd")
+
+	// If given a future cursor, just live tail
+	if cr.Cursor != nil && *cr.Cursor > time.Now().UnixMicro() {
+		cr.Cursor = nil
+	}
+
+	return nil
+}
+
+func (s *Subscriber) UpdateConfiguration() {
+
 }

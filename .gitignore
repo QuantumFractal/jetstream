@@ -23,6 +23,8 @@
 # Go workspace file
 go.work
 
+# Build artifacts
+jetstream
 
 .env
 data/
