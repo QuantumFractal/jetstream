@@ -66,6 +66,18 @@ $ websocat "ws://localhost:6008/subscribe?wantedCollections=app.bsky.feed.post&w
 
 ### Example events:
 
+Jetstream events have 3 `type`s (so far):
+
+- `com`: a Commit to a repo which involves either a create, update, or delete of a record
+- `id`: an Identity update for a DID which indicates that you may want to purge an identity cache and revalidate the DID doc and handle
+- `acc`: an Account event that indicates a change in account status i.e. from `active` to `deactivated`, or to `takendown` if the PDS has taken down the repo.
+
+Jetstream Commits have 3 `types`:
+
+- `c`: Create a new record with the contents provided
+- `u`: Update an existing record and replace it with the contents provided
+- `d`: Delete an existing record with the DID, Collection, and RKey provided
+
 #### A like committed to a repo
 
 ```json
